@@ -29,7 +29,6 @@ import {
   readlinkSync,
   realpathSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -40,8 +39,9 @@ import { syncPolicyProjection } from '../mods/policy-projection.js';
 const POLICY_DIR = join('.claude-flow', 'policy');
 const POLICY_FILE = 'state.json';
 const LOCK_FILE = 'state.lock';
-const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 5_000;
+const LOCK_CREATE_FLAGS = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+  | (process.platform === 'win32' ? 0 : (fsConstants.O_NOFOLLOW ?? 0));
 // A lock is ~170 bytes plus the hostname (at most 255 bytes).
 const LOCK_MAX_BYTES = 1_024;
 // Linux PID namespace of this process, e.g. `pid:[4026531836]`; undefined on
@@ -86,7 +86,7 @@ function isPidAlive(pid: number): boolean {
 /**
  * Reads a lock only if it is a small regular file: never follows a symlink,
  * never blocks on a FIFO or device, never reads more than LOCK_MAX_BYTES.
- * Anything else returns undefined and the caller keeps the mtime rule.
+ * Anything else returns undefined; unknown owners are preserved.
  */
 function readLockFile(lockPath: string): string | undefined {
   if (!lstatSync(lockPath).isFile()) return undefined;
@@ -108,13 +108,13 @@ function readLockFile(lockPath: string): string | undefined {
  * A process killed inside a transaction (SIGKILL, OOM, or a signal whose
  * default action terminates it) never runs `finally { release() }`, so every
  * caller, MCP reads included, waited LOCK_WAIT_MS and failed with
- * policy-state-lock-timeout until the orphan's mtime crossed LOCK_STALE_MS.
+ * policy-state-lock-timeout until the orphan aged past the old stale limit.
  * The pid is trusted only if the lock was written by this OS, on this kernel
  * boot and in this PID namespace: anywhere else (a bwrap --unshare-pid
  * sandbox, a container, another machine on a shared filesystem) a live owner
  * also answers ESRCH. Locks without that identity (older ruflo, a crash
- * between create and write, anything unparsable) return false and keep the
- * mtime rule.
+ * between create and write, anything unparsable) return false and require
+ * explicit operator inspection rather than age-only takeover.
  */
 function lockOwnerIsDead(lockPath: string): boolean {
   try {
@@ -138,9 +138,65 @@ function lockOwnerIsDead(lockPath: string): boolean {
     // stand in for that — ext4 reuses a freed inode number at once, and before
     // Linux 6.13 two files created in one clock tick share a ctime.
     return readLockFile(lockPath) === read;
-  } catch {
-    return false;
+  } catch (error) {
+    // Malformed ownership is unknown, and a vanished lock is a normal race.
+    // Filesystem failures are not evidence of a live owner or contention.
+    if (error instanceof SyntaxError || (error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw lockPathError(error);
   }
+}
+
+/**
+ * Serialize dead-owner probing and unlink across cooperating reclaimers.
+ * An orphaned guard fails closed: its exact owner must be inspected before
+ * explicit recovery, never inferred from its age.
+ */
+function reclaimDeadLock(lockPath: string): void {
+  const guard = `${lockPath}.reclaim`;
+  let fd: number;
+  try { fd = openSync(guard, LOCK_CREATE_FLAGS, 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw lockPathError(error);
+    existingLockIsRegular(guard);
+    return;
+  }
+  const ownership = JSON.stringify({
+    pid: process.pid, nonce: randomUUID(), host: hostname(),
+    platform: process.platform, pidns: PID_NAMESPACE, boot: BOOT_ID,
+  });
+  try {
+    writeFileSync(fd, ownership);
+    if (lockOwnerIsDead(lockPath)) unlinkSync(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw lockPathError(error);
+  }
+  finally {
+    try { closeSync(fd); } catch (error) { throw lockPathError(error); }
+    try { if (readLockFile(guard) === ownership) unlinkSync(guard); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw lockPathError(error);
+    }
+  }
+}
+
+function lockPathError(error: unknown): Error {
+  if (error instanceof Error && error.message.startsWith('policy-state-lock-error:')) return error;
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return new Error(code === 'ELOOP'
+    ? 'policy-state-lock-error: lock path is not a regular file'
+    : `policy-state-lock-error: ${code ?? (error instanceof Error ? error.message : String(error))}`);
+}
+
+/** False only when a competing owner removed the path before inspection. */
+function existingLockIsRegular(lockPath: string): boolean {
+  let stat;
+  try { stat = lstatSync(lockPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw lockPathError(error);
+  }
+  if (!stat.isFile()) throw new Error('policy-state-lock-error: lock path is not a regular file');
+  return true;
 }
 
 /**
@@ -151,28 +207,34 @@ export async function acquireLock(lockPath: string): Promise<() => void> {
   const started = Date.now();
   while (Date.now() - started < LOCK_WAIT_MS) {
     try {
-      const fd = openSync(lockPath, 'wx', 0o600);
-      writeFileSync(fd, JSON.stringify({
+      // Exclusive creation plus O_NOFOLLOW where supported; existing paths
+      // are inspected without following links before treating them as locks.
+      const fd = openSync(lockPath, LOCK_CREATE_FLAGS, 0o600);
+      const ownership = JSON.stringify({
         pid: process.pid,
         acquiredAt: Date.now(),
         host: hostname(),
         platform: process.platform,
         pidns: PID_NAMESPACE,
         boot: BOOT_ID,
-      }));
-      closeSync(fd);
+        nonce: randomUUID(),
+      });
+      try { writeFileSync(fd, ownership); } finally { closeSync(fd); }
       return () => {
-        try { unlinkSync(lockPath); } catch { /* already released */ }
+        try { if (readLockFile(lockPath) === ownership) unlinkSync(lockPath); } catch { /* already released */ }
       };
-    } catch {
-      try {
-        if (lockOwnerIsDead(lockPath)
-          || Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) unlinkSync(lockPath);
-      } catch { /* another process changed the lock */ }
+    } catch (error) {
+      // Only EEXIST is contention. Access, path and I/O failures must not
+      // turn into a misleading five-second timeout on every MCP invocation.
+      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw lockPathError(error);
+      if (!existingLockIsRegular(lockPath)) continue;
+      reclaimDeadLock(lockPath);
       await sleep(10);
     }
   }
-  throw new Error('policy-state-lock-timeout');
+  throw new Error(lockOwnerIsDead(lockPath)
+    ? 'policy-state-lock-timeout: dead owner; inspect exact owner of the reclamation guard before explicit recovery'
+    : 'policy-state-lock-timeout');
 }
 
 // #3398: Windows rename over a file another process holds open fails with

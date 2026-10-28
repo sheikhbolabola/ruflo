@@ -317,21 +317,13 @@ export const coordinationTools: MCPTool[] = [
       }
 
       if (action === 'trigger') {
-        store.sync.syncCount++;
-        store.sync.lastSync = new Date().toISOString();
-        store.sync.pendingChanges = 0;
-
-        // Simulate sync
-        await new Promise(resolve => setTimeout(resolve, 50));
-
-        saveCoordStore(store);
-
+        // Nodes are local records; no backend transfers state between them.
         return {
-          success: true,
-          action: 'synchronized',
+          success: false,
+          action: 'trigger',
+          error: 'Synchronization is unavailable: coordination nodes are local records with no sync backend, so nothing would be transferred.',
           syncCount: store.sync.syncCount,
-          syncedAt: store.sync.lastSync,
-          nodesSync: Object.keys(store.nodes).length,
+          lastSync: store.sync.lastSync,
         };
       }
 

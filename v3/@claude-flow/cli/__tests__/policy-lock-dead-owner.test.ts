@@ -207,10 +207,12 @@ describe('policy state.lock owned by a dead process', () => {
 });
 
 describe('policy state.lock that must still be waited for', () => {
-  it('a live owner', async () => {
+  it('a live owner past the old stale threshold', async () => {
     const { root, lock, owner } = await setup();
     const content = JSON.stringify({ ...owner, pid: livePid() });
     plantLock(lock, content);
+    const old = (Date.now() - LOCK_STALE_MS - 5_000) / 1000;
+    utimesSync(lock, old, old);
     await expectWaitsForOwner(root, lock, content);
   }, 15_000);
 
@@ -223,6 +225,8 @@ describe('policy state.lock that must still be waited for', () => {
     expect(['alive', 'EPERM']).toContain(signalProbe(1));
     const content = JSON.stringify({ ...owner, pid: 1 });
     plantLock(lock, content);
+    const old = (Date.now() - LOCK_STALE_MS - 5_000) / 1000;
+    utimesSync(lock, old, old);
     await expectWaitsForOwner(root, lock, content);
   }, 15_000);
 
@@ -276,6 +280,8 @@ describe('policy state.lock that must still be waited for', () => {
     const { root, lock, owner } = await setup();
     const content = build(owner, await deadPid());
     plantLock(lock, content);
+    const old = (Date.now() - LOCK_STALE_MS - 5_000) / 1000;
+    utimesSync(lock, old, old);
     await expectWaitsForOwner(root, lock, content);
   }, 15_000);
 
@@ -287,6 +293,8 @@ describe('policy state.lock that must still be waited for', () => {
     expect(typeof owner.boot).toBe('string');
     const content = JSON.stringify({ ...owner, pid: await deadPid(), boot: '00000000-0000-0000-0000-000000000000' });
     plantLock(lock, content);
+    const old = (Date.now() - LOCK_STALE_MS - 5_000) / 1000;
+    utimesSync(lock, old, old);
     await expectWaitsForOwner(root, lock, content);
   }, 15_000);
 });
@@ -342,6 +350,26 @@ describe('lock path type and creation failures', () => {
     await expect(acquireLock(lock)).rejects.toThrow('policy-state-lock-error: lock path is not a regular file');
     expect(Date.now() - started).toBeLessThan(LOCK_WAIT_MS / 5);
     expect(existsSync(lock)).toBe(true);
+  });
+
+  it('a repeated release preserves a later lock acquired in the same clock tick', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-policy-lock-release-'));
+    roots.push(root);
+    const lock = join(root, 'state.lock');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
+    try {
+      const firstRelease = await acquireLock(lock);
+      firstRelease();
+      const secondRelease = await acquireLock(lock);
+      const owner = readFileSync(lock, 'utf8');
+
+      firstRelease();
+      expect(readFileSync(lock, 'utf8')).toBe(owner);
+      secondRelease();
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it.skipIf(process.platform === 'win32')('does not create through a dangling symlink', async () => {

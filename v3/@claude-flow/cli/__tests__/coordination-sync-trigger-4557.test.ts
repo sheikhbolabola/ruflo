@@ -6,7 +6,7 @@
  * sync record untouched.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,6 +25,7 @@ beforeEach(() => {
 afterEach(() => {
   if (originalProjectCwd === undefined) delete process.env.CLAUDE_FLOW_CWD;
   else process.env.CLAUDE_FLOW_CWD = originalProjectCwd;
+  rmSync(scratch, { recursive: true, force: true });
 });
 
 describe('coordination_sync trigger (#4557)', () => {
@@ -48,7 +49,11 @@ describe('coordination_sync trigger (#4557)', () => {
     mkdirSync(dir, { recursive: true });
     const storePath = join(dir, 'store.json');
     // Pin lastSync so status is stable across loads.
-    const seeded = { nodes: {}, sync: { lastSync: '2026-01-01T00:00:00.000Z', syncCount: 3, conflicts: 0, pendingChanges: 2 } };
+    const lastSync = '2026-01-01T00:00:00.000Z';
+    const seeded = {
+      nodes: { one: { id: 'one', status: 'active', load: 0, lastHeartbeat: lastSync } },
+      sync: { lastSync, syncCount: 3, conflicts: 2, pendingChanges: 2 },
+    };
     writeFileSync(storePath, JSON.stringify(seeded));
     const fileBefore = readFileSync(storePath);
     const statusBefore = JSON.stringify((await sync({ action: 'status' })).sync);
@@ -56,13 +61,19 @@ describe('coordination_sync trigger (#4557)', () => {
     expect(r).toMatchObject({ success: false, syncCount: 3, lastSync: '2026-01-01T00:00:00.000Z' });
     expect(readFileSync(storePath)).toEqual(fileBefore);
     expect(JSON.stringify((await sync({ action: 'status' })).sync)).toBe(statusBefore);
+
+    expect(await sync({ action: 'resolve', conflictResolution: 'merge' })).toMatchObject({
+      success: true, action: 'resolved', strategy: 'merge', conflictsResolved: 2,
+    });
+    expect(await sync({ action: 'status' })).toMatchObject({
+      success: true, status: 'pending', sync: { lastSync, syncCount: 3, conflicts: 0, pendingChanges: 2 },
+    });
   });
 
   it('does not persist a sync', async () => {
     await sync({ action: 'trigger' });
     const storePath = join(scratch, '.claude-flow', 'coordination', 'store.json');
-    // Baseline: store.json written with syncCount 1 and a fresh lastSync.
-    if (existsSync(storePath)) expect(JSON.parse(readFileSync(storePath, 'utf8')).sync.syncCount).toBe(0);
+    expect(existsSync(storePath)).toBe(false);
   });
 
   it('leaves status and resolve as they were (control)', async () => {
